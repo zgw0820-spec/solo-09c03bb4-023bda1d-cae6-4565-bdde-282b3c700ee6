@@ -1,10 +1,19 @@
 """SQLite persistence for the edge gateway.
 
 Tables:
-  upstreams  - registered upstream targets (seeded from env, upserted on boot)
-  routes     - single-row table holding the effective route and its version
-  inflight   - one row per admitted proxied request; wiped on startup so a
-               restarted gateway never reports interrupted requests as in-flight
+  upstreams  - registered upstream targets (seeded once from env; afterwards
+               the database is the source of truth and addresses are replaced
+               via the ops API, so a reboot never silently reverts them)
+  routes     - single-row table holding the effective route and its version;
+               the version is bumped by target switches AND by address
+               replacements, so a probe/commit interleaved with either loses
+               its compare-and-swap
+  inflight   - one row per admitted proxied request, carrying the route
+               target AND the exact upstream URL snapshotted at admission
+               time; rows are owned by the gateway instance that admitted
+               them and each instance wipes only its own rows on startup, so
+               a restarted gateway never reports interrupted requests as
+               in-flight (and never erases a surviving peer's rows)
   probes     - audit log of candidate probes; a commit requires a fresh,
                successful probe recorded against the same route version
 """
@@ -12,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sqlite3
 import threading
 import time
@@ -20,6 +30,9 @@ from pathlib import Path
 
 DB_PATH = Path(os.environ.get("GATEWAY_DB", "/data/gateway.db"))
 PROBE_TTL_SECONDS = float(os.environ.get("PROBE_TTL_SECONDS", "60"))
+# Stable identity of this gateway process across restarts; in-flight rows are
+# owned by it, so two gateways sharing one database clean up only themselves.
+INSTANCE = os.environ.get("GATEWAY_INSTANCE") or socket.gethostname()
 
 _lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
@@ -34,9 +47,16 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def init_db(upstreams: dict[str, str], initial_target: str) -> dict:
-    """Create tables, upsert the upstream registry, seed the route once,
-    and drop in-flight rows left behind by a previous (killed) process."""
+    """Create tables, seed the upstream registry and route once, and drop
+    this instance's in-flight rows left behind by a previous (killed)
+    process. Safe to run concurrently from two gateways sharing the file."""
     global _conn
     if not upstreams:
         raise RuntimeError("no upstreams configured")
@@ -59,7 +79,9 @@ def init_db(upstreams: dict[str, str], initial_target: str) -> dict:
             CREATE TABLE IF NOT EXISTS inflight (
                 id         TEXT PRIMARY KEY,
                 target     TEXT NOT NULL,
+                url        TEXT NOT NULL DEFAULT '',
                 path       TEXT NOT NULL,
+                owner      TEXT NOT NULL DEFAULT '',
                 started_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS probes (
@@ -72,23 +94,37 @@ def init_db(upstreams: dict[str, str], initial_target: str) -> dict:
             );
             """
         )
+        # Migrate databases written before inflight carried url/owner.
+        _ensure_column(_conn, "inflight", "url", "url TEXT NOT NULL DEFAULT ''")
+        _ensure_column(_conn, "inflight", "owner", "owner TEXT NOT NULL DEFAULT ''")
+        # Rows left by a pre-upgrade process belong to interrupted requests of
+        # the previous incarnation on this host; adopt, then clear them below.
+        _conn.execute("UPDATE inflight SET owner = ? WHERE owner = ''", (INSTANCE,))
+        # Seed the registry once: operator address updates must survive
+        # restarts instead of being silently reverted to env values.
         for name, url in upstreams.items():
             _conn.execute(
                 "INSERT INTO upstreams (name, url) VALUES (?, ?) "
-                "ON CONFLICT(name) DO UPDATE SET url = excluded.url",
+                "ON CONFLICT(name) DO NOTHING",
                 (name, url),
             )
-        seeded = False
-        if _conn.execute("SELECT COUNT(*) AS c FROM routes").fetchone()["c"] == 0:
-            _conn.execute(
-                "INSERT INTO routes (id, current_target, version, updated_at) "
-                "VALUES (1, ?, 0, ?)",
-                (initial_target, time.time()),
-            )
-            seeded = True
-        # Interrupted requests of a previous process must not linger as in-flight.
-        cleared = _conn.execute("DELETE FROM inflight").rowcount
-    return {"seeded_route": seeded, "cleared_inflight": cleared}
+        cur = _conn.execute(
+            "INSERT OR IGNORE INTO routes (id, current_target, version, updated_at) "
+            "VALUES (1, ?, 0, ?)",
+            (initial_target, time.time()),
+        )
+        seeded = cur.rowcount == 1
+        # Interrupted requests of a previous process must not linger as
+        # in-flight. Only this instance's rows: a peer gateway sharing the
+        # database may still be serving its own.
+        cleared = _conn.execute(
+            "DELETE FROM inflight WHERE owner = ?", (INSTANCE,)
+        ).rowcount
+    return {
+        "seeded_route": seeded,
+        "cleared_inflight": cleared,
+        "instance": INSTANCE,
+    }
 
 
 def _db() -> sqlite3.Connection:
@@ -112,25 +148,78 @@ def upstream_url(name: str) -> str | None:
     return row["url"] if row else None
 
 
-def admit(path: str) -> dict:
-    """Atomically snapshot the effective route and register the request as
-    in-flight. The request keeps this target even if a switch commits while
-    it is running, so it always completes against the original upstream."""
+def admit(path: str) -> dict | None:
+    """Atomically snapshot the effective route *and* the upstream address,
+    and register the request as in-flight — all in one locked transaction.
+
+    The request keeps this exact (target, url) pair even if a switch commits
+    or another instance replaces the address while it is running, so it
+    always completes against the address that was effective at admission.
+    """
     rid = uuid.uuid4().hex
     with _lock, _db() as conn:
-        route = conn.execute(
-            "SELECT current_target, version FROM routes WHERE id = 1"
+        row = conn.execute(
+            "SELECT r.current_target AS target, r.version AS version, u.url AS url "
+            "FROM routes r JOIN upstreams u ON u.name = r.current_target "
+            "WHERE r.id = 1"
         ).fetchone()
+        if row is None:
+            return None
         conn.execute(
-            "INSERT INTO inflight (id, target, path, started_at) VALUES (?, ?, ?, ?)",
-            (rid, route["current_target"], path, time.time()),
+            "INSERT INTO inflight (id, target, url, path, owner, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (rid, row["target"], row["url"], path, INSTANCE, time.time()),
         )
-    return {"id": rid, "target": route["current_target"], "version": route["version"]}
+    return {
+        "id": rid,
+        "target": row["target"],
+        "url": row["url"],
+        "version": row["version"],
+    }
 
 
 def finish(request_id: str) -> None:
     with _lock, _db() as conn:
         conn.execute("DELETE FROM inflight WHERE id = ?", (request_id,))
+
+
+def update_upstream(name: str, url: str) -> dict:
+    """Replace the registered address of an existing upstream.
+
+    Takes effect for requests admitted after the update; requests admitted
+    before it keep the address they snapshotted. Bumps the route version so
+    a probe/commit interleaved with the replacement loses its CAS instead of
+    acting on a stale view of where the target points.
+    """
+    with _lock, _db() as conn:
+        row = conn.execute(
+            "SELECT url FROM upstreams WHERE name = ?", (name,)
+        ).fetchone()
+        if row is None:
+            return {"ok": False, "error": "unknown_target"}
+        route = conn.execute("SELECT version FROM routes WHERE id = 1").fetchone()
+        if row["url"] == url:
+            return {
+                "ok": True,
+                "unchanged": True,
+                "name": name,
+                "url": url,
+                "old_url": row["url"],
+                "version": route["version"],
+            }
+        conn.execute("UPDATE upstreams SET url = ? WHERE name = ?", (url, name))
+        conn.execute(
+            "UPDATE routes SET version = version + 1, updated_at = ? WHERE id = 1",
+            (time.time(),),
+        )
+        return {
+            "ok": True,
+            "unchanged": False,
+            "name": name,
+            "url": url,
+            "old_url": row["url"],
+            "version": route["version"] + 1,
+        }
 
 
 def record_probe(target: str, base_version: int, ok: bool, detail: dict) -> dict:
@@ -147,8 +236,9 @@ def record_probe(target: str, base_version: int, ok: bool, detail: dict) -> dict
 
 def commit_switch(target: str, base_version: int, probe_id: str) -> dict:
     """Compare-and-swap the route on its version. A commit carrying a stale
-    version (e.g. a late probe from an interleaved switch attempt) loses and
-    cannot overwrite the already-effective route."""
+    version (e.g. a late probe from an interleaved switch attempt, or one
+    overtaken by an address replacement) loses and cannot overwrite the
+    already-effective route."""
     with _lock, _db() as conn:
         route = conn.execute(
             "SELECT current_target, version FROM routes WHERE id = 1"
@@ -222,6 +312,7 @@ def get_state() -> dict:
         p["detail"] = json.loads(p["detail"]) if p["detail"] else {}
     return {
         "now": now,
+        "instance": INSTANCE,
         "route": route,
         "upstreams": upstreams,
         "inflight": inflight,

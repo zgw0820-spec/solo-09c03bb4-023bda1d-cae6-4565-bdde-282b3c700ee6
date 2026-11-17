@@ -2,6 +2,7 @@
 exposes the operations API + web console for on-duty target switching."""
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from contextlib import asynccontextmanager
@@ -15,6 +16,11 @@ from pydantic import BaseModel, Field
 from . import db
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+# Demo/test knob: widen the window between admission and the upstream call so
+# a human (or a test) can interleave an address replacement in between. The
+# admitted request still uses its admission-time snapshot. Default 0.
+ADMIT_DELAY_MS = int(os.environ.get("GATEWAY_ADMIT_DELAY_MS", "0"))
 
 
 def parse_upstreams() -> dict[str, str]:
@@ -70,14 +76,23 @@ class CallRequest(BaseModel):
 
 @app.post("/api/call")
 async def call(req: CallRequest):
-    """Admit a request and proxy it to the upstream that is current *at
-    admission time*. The full upstream response is fetched from that original
-    target even if a switch commits while the request is in flight."""
+    """Admit a request and proxy it to the upstream address snapshotted *at
+    admission time*. The full upstream response is fetched from that exact
+    address even if a switch commits or the address is replaced while the
+    request is in flight; a failing snapshot address yields an error, never
+    a silent re-route to the new address."""
     path = req.path if req.path.startswith("/") else "/work"
     if "://" in path or ".." in path:
         return JSONResponse(status_code=400, content={"ok": False, "error": "bad_path"})
     admission = db.admit(path)
-    target_url = db.upstream_url(admission["target"])
+    if admission is None:
+        return JSONResponse(
+            status_code=503, content={"ok": False, "error": "route_unresolvable"}
+        )
+    # The address below comes from the admission snapshot, not a fresh lookup.
+    target_url = admission["url"]
+    if ADMIT_DELAY_MS:
+        await asyncio.sleep(ADMIT_DELAY_MS / 1000)
     started = time.monotonic()
     try:
         params = {} if req.delay_ms is None else {"delay_ms": req.delay_ms}
@@ -91,6 +106,7 @@ async def call(req: CallRequest):
             "status": resp.status_code,
             "request_id": admission["id"],
             "target": admission["target"],
+            "url": target_url,
             "route_version": admission["version"],
             "duration_ms": int((time.monotonic() - started) * 1000),
             "upstream": body,
@@ -103,11 +119,36 @@ async def call(req: CallRequest):
                 "error": f"upstream_error: {exc}",
                 "request_id": admission["id"],
                 "target": admission["target"],
+                "url": target_url,
                 "route_version": admission["version"],
             },
         )
     finally:
         db.finish(admission["id"])
+
+
+class UpstreamUpdate(BaseModel):
+    name: str
+    url: str
+
+
+@app.post("/api/upstreams/update")
+def update_upstream(req: UpstreamUpdate):
+    """Replace the registered address of an existing upstream. Requests
+    admitted before the update keep going to the old address; requests
+    admitted after it go to the new one. Bumps the route version."""
+    name = req.name.strip()
+    url = req.url.strip().rstrip("/")
+    if (
+        not url.startswith(("http://", "https://"))
+        or any(c.isspace() for c in url)
+        or len(url) > 300
+    ):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad_url"})
+    res = db.update_upstream(name, url)
+    if not res["ok"]:
+        return JSONResponse(status_code=404, content=res)
+    return res
 
 
 class ProbeRequest(BaseModel):

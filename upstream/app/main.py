@@ -15,7 +15,10 @@ DEFAULT_DELAY_MS = int(os.environ.get("DEFAULT_DELAY_MS", "0"))
 MAX_DELAY_MS = 60_000
 
 app = FastAPI(title=f"upstream-{NAME}")
-_state = {"health_fail": os.environ.get("HEALTH_FAIL", "0") == "1"}
+_state = {
+    "health_fail": os.environ.get("HEALTH_FAIL", "0") == "1",
+    "work_fail": os.environ.get("WORK_FAIL", "0") == "1",
+}
 
 
 @app.get("/health")
@@ -38,8 +41,19 @@ def set_health_mode(mode: HealthMode):
     return {"upstream": NAME, "health_fail": _state["health_fail"]}
 
 
+@app.post("/admin/work_mode")
+def set_work_mode(mode: HealthMode):
+    """Demo hook: make /work fail or recover at runtime."""
+    _state["work_fail"] = mode.fail
+    return {"upstream": NAME, "work_fail": _state["work_fail"]}
+
+
 @app.api_route("/work", methods=["GET", "POST"])
 async def work(delay_ms: int | None = Query(default=None)):
+    if _state["work_fail"]:
+        return JSONResponse(
+            status_code=503, content={"status": "failing", "upstream": NAME}
+        )
     delay = DEFAULT_DELAY_MS if delay_ms is None else max(0, min(delay_ms, MAX_DELAY_MS))
     await asyncio.sleep(delay / 1000)
     return {"upstream": NAME, "delay_ms": delay, "ts": time.time()}

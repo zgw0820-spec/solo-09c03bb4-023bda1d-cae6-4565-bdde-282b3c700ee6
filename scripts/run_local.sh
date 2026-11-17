@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Local end-to-end harness: starts two upstreams + gateway (no docker needed),
-# runs the smoke test, kills the gateway mid-request, restarts it, and checks
-# recovery. Mirrors what docker-compose.yml wires up for containers.
+# Local end-to-end harness: starts three upstreams + two gateways sharing one
+# SQLite database (no docker needed), runs the smoke test, kills gateway-1
+# mid-request, restarts it, and checks recovery. Mirrors what
+# docker-compose.yml wires up for containers.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,7 +10,9 @@ WORK="${WORK_DIR:-/tmp/edge-gw-demo}"
 SAVE="$WORK/phase1.json"
 PY="${PYTHON:-python3}"
 GW_PORT="${GW_PORT:-8000}"
+GW2_PORT="${GW2_PORT:-8001}"
 UP_A_PORT="${UP_A_PORT:-9001}"
+UP_A2_PORT="${UP_A2_PORT:-9003}"
 UP_B_PORT="${UP_B_PORT:-9002}"
 
 rm -rf "$WORK"
@@ -27,14 +30,19 @@ start_upstream() { # name port delay
   PIDS+=($!)
 }
 
-start_gateway() {
+GW1_PID=""
+start_gateway() { # instance port admit_delay_ms
   GATEWAY_DB="$WORK/gateway.db" \
+  GATEWAY_INSTANCE="$1" \
+  GATEWAY_ADMIT_DELAY_MS="$3" \
   UPSTREAMS="alpha=http://127.0.0.1:$UP_A_PORT;beta=http://127.0.0.1:$UP_B_PORT;dead=http://127.0.0.1:9" \
   INITIAL_TARGET=alpha \
     "$PY" -m uvicorn app.main:app --app-dir "$ROOT/gateway" \
-      --host 127.0.0.1 --port "$GW_PORT" --log-level warning \
-      >>"$WORK/gateway.log" 2>&1 &
-  PIDS+=($!)
+      --host 127.0.0.1 --port "$2" --log-level warning \
+      >>"$WORK/gateway-$1.log" 2>&1 &
+  local pid=$!
+  PIDS+=($pid)
+  if [ "$1" = "gw1" ]; then GW1_PID=$pid; fi
 }
 
 wait_ready() { # url
@@ -46,31 +54,39 @@ wait_ready() { # url
   return 1
 }
 
-echo "== 启动上游 alpha(:$UP_A_PORT, 延迟2000ms) / beta(:$UP_B_PORT, 延迟500ms) =="
-start_upstream alpha "$UP_A_PORT" 2000
-start_upstream beta  "$UP_B_PORT" 500
+echo "== 启动上游 alpha(:$UP_A_PORT, 延迟2000ms) / alpha2(:$UP_A2_PORT, 延迟300ms) / beta(:$UP_B_PORT, 延迟500ms) =="
+start_upstream alpha  "$UP_A_PORT"  2000
+start_upstream alpha2 "$UP_A2_PORT" 300
+start_upstream beta   "$UP_B_PORT"  500
 wait_ready "http://127.0.0.1:$UP_A_PORT/health"
+wait_ready "http://127.0.0.1:$UP_A2_PORT/health"
 wait_ready "http://127.0.0.1:$UP_B_PORT/health"
 
-echo "== 启动网关(:$GW_PORT) =="
-start_gateway
+echo "== 启动网关 gw1(:$GW_PORT) 与 gw2(:$GW2_PORT)，共用同一 SQLite 库 =="
+# gw1 放大接单→发出的交错窗口，便于确定性复现地址替换交错
+start_gateway gw1 "$GW_PORT" 800
+start_gateway gw2 "$GW2_PORT" 0
 wait_ready "http://127.0.0.1:$GW_PORT/api/health"
+wait_ready "http://127.0.0.1:$GW2_PORT/api/health"
 
-echo "== 阶段一：切换语义 =="
+export GW2_BASE="http://127.0.0.1:$GW2_PORT"
+export ALPHA2_URL="http://127.0.0.1:$UP_A2_PORT"
+export UP_A_URL="http://127.0.0.1:$UP_A_PORT"
+
+echo "== 阶段一：地址替换交错 + 切换语义 =="
 "$PY" "$ROOT/scripts/smoke_test.py" "http://127.0.0.1:$GW_PORT" "$SAVE" phase1 &
 SMOKE=$!
 
 # wait until phase1 has armed the to-be-interrupted in-flight request
-for _ in $(seq 1 300); do [ -f "$SAVE" ] && break; sleep 0.1; done
+for _ in $(seq 1 400); do [ -f "$SAVE" ] && break; sleep 0.1; done
 [ -f "$SAVE" ] || { echo "phase1 未到达重启点" >&2; exit 1; }
 
-GW_PID="${PIDS[-1]}"
-echo "== kill -9 网关（模拟崩溃，beta 上仍有 1 条在途请求） =="
-kill -9 "$GW_PID" 2>/dev/null || true
+echo "== kill -9 gw1（模拟崩溃，beta 上仍有 1 条在途请求；gw2 继续运行） =="
+kill -9 "$GW1_PID" 2>/dev/null || true
 wait "$SMOKE"
 
-echo "== 重启网关（同一 SQLite 数据文件） =="
-start_gateway
+echo "== 重启 gw1（同一 SQLite 数据文件，gw2 未中断） =="
+start_gateway gw1 "$GW_PORT" 800
 wait_ready "http://127.0.0.1:$GW_PORT/api/health"
 
 echo "== 阶段二：重启恢复 =="

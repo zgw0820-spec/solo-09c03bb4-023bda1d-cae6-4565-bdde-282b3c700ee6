@@ -51,7 +51,7 @@
     <label>响应延迟(ms) <input id="delay" type="number" value="3000" min="0" max="60000" style="width:90px"></label>
     <button onclick="fire(1)">发送 1 个</button>
     <button onclick="fire(5)">并发 5 个</button>
-    <span class="muted">请求在接纳时绑定当时的目标，切换后仍从原上游取回完整响应</span>
+    <span class="muted">请求在接纳时绑定当时的目标与地址，切换或换地址后仍从原地址取回完整响应</span>
     <ul id="req-log"></ul>
   </section>
 
@@ -66,6 +66,17 @@
     <div class="muted" id="version-hint"></div>
     <h2 style="margin-top:14px">最近探测</h2>
     <ul id="probe-log"></ul>
+  </section>
+
+  <section>
+    <h2>替换上游地址</h2>
+    <div>
+      上游 <select id="addr-target" onchange="syncAddrInput()"></select>
+      新地址 <input id="addr-url" style="width:230px" placeholder="http://host:port">
+      <button class="warn" onclick="doAddrUpdate()">更新地址</button>
+    </div>
+    <div class="msg" id="addr-msg"></div>
+    <div class="muted">更新立即对接单生效并令版号 +1：此前接纳的请求仍访问旧地址，此后接纳的走新地址；旧地址故障只报错，不偷偷改投</div>
   </section>
 
   <section>
@@ -111,8 +122,8 @@ async function refresh() {
 
 function render() {
   const r = state.route;
-  let html = `当前目标 <b>${esc(r.current_target)}</b> · 路由版号 <b>v${r.version}</b> · ` +
-             `更新于 ${new Date(r.updated_at * 1000).toLocaleTimeString()}`;
+  let html = `实例 <b>${esc(state.instance)}</b> · 当前目标 <b>${esc(r.current_target)}</b> · ` +
+             `路由版号 <b>v${r.version}</b> · 更新于 ${new Date(r.updated_at * 1000).toLocaleTimeString()}`;
   if (state.boot && state.boot.cleared_inflight)
     html += ` · 本次启动已清理中断在途 ${state.boot.cleared_inflight} 条`;
   $('route-summary').innerHTML = html;
@@ -132,8 +143,16 @@ function render() {
     .map(u => `<option value="${esc(u.name)}">${esc(u.name)}</option>`).join('');
   if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
 
+  const addrSel = $('addr-target');
+  const prevAddr = addrSel.value;
+  addrSel.innerHTML = state.upstreams
+    .map(u => `<option value="${esc(u.name)}">${esc(u.name)}</option>`).join('');
+  if ([...addrSel.options].some(o => o.value === prevAddr)) addrSel.value = prevAddr;
+  if (document.activeElement !== $('addr-url')) syncAddrInput();
+
   $('inflight-list').innerHTML = state.inflight.map(x =>
-    `<li>#${x.id.slice(0,8)} → <b>${esc(x.target)}</b> ${esc(x.path)} · 已进行 ${x.age_ms}ms</li>`
+    `<li>#${x.id.slice(0,8)} → <b>${esc(x.target)}</b> @${esc(x.url)} ${esc(x.path)}` +
+    ` · 实例 ${esc(x.owner)} · 已进行 ${x.age_ms}ms</li>`
   ).join('') || '<li class="muted">（无在途请求）</li>';
 
   $('probe-log').innerHTML = state.recent_probes.map(p =>
@@ -142,6 +161,30 @@ function render() {
   ).join('') || '<li class="muted">（暂无）</li>';
 
   updateSwitchPanel();
+}
+
+function syncAddrInput() {
+  const u = state && state.upstreams.find(x => x.name === $('addr-target').value);
+  if (u) $('addr-url').value = u.url;
+}
+
+async function doAddrUpdate() {
+  const name = $('addr-target').value;
+  const url = $('addr-url').value.trim();
+  const msg = $('addr-msg');
+  if (!name || !url) return;
+  const { status, body } = await api('POST', '/api/upstreams/update', { name, url });
+  if (status === 200 && body && body.ok) {
+    msg.className = 'msg ok';
+    msg.textContent = body.unchanged
+      ? `${name} 地址未变化（版号保持 v${body.version}）`
+      : `已更新 ${name}：${body.old_url} → ${body.url}（版号 v${body.version}）。` +
+        `此前接纳的请求仍走旧地址，新请求走新地址`;
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = `更新被拒绝：${(body && body.error) || status}`;
+  }
+  await refresh();
 }
 
 function updateSwitchPanel() {
@@ -211,11 +254,14 @@ async function fireOne(delay) {
   const dt = Math.round(performance.now() - t0);
   const li = document.getElementById(id);
   if (body && body.ok) {
+    const node = (body.upstream && body.upstream.upstream) || '?';
     li.className = 'done';
-    li.textContent = `✓ #${body.request_id.slice(0,8)} 由 ${body.target} 完整返回 · 耗时 ${dt}ms · 上游延迟 ${body.upstream.delay_ms}ms`;
+    li.textContent = `✓ #${body.request_id.slice(0,8)} 目标 ${body.target} @${body.url}` +
+                     ` · 实际响应节点 ${node} · 耗时 ${dt}ms`;
   } else {
     li.className = 'fail';
-    li.textContent = `✗ ${status} ${body && (body.error || '') || ''}`;
+    const where = body && body.target ? ` 目标 ${body.target} @${body.url}` : '';
+    li.textContent = `✗ ${status}${where} ${body && (body.error || '') || ''}`;
   }
   refresh();
 }

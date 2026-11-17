@@ -1,13 +1,21 @@
 name: edge-gateway-demo
 
 services:
-  upstream-a:
+  upstream-a:          # alpha 当前指向的旧节点
     build: ./upstream
     environment:
       UPSTREAM_NAME: alpha
       DEFAULT_DELAY_MS: "3000"   # 默认响应延迟，可被请求参数 delay_ms 覆盖
     ports:
       - "9001:8000"
+
+  upstream-a2:         # 演示地址替换用的新节点（仅作为地址，不是可切换目标）
+    build: ./upstream
+    environment:
+      UPSTREAM_NAME: alpha2
+      DEFAULT_DELAY_MS: "400"
+    ports:
+      - "9003:8000"
 
   upstream-b:
     build: ./upstream
@@ -17,19 +25,38 @@ services:
     ports:
       - "9002:8000"
 
-  gateway:
+  gateway-1:
     build: ./gateway
     environment:
-      # 已登记的上游清单；启动时写入 SQLite，重启后按已登记路由接流量
+      # 已登记的上游清单；仅首次启动写入 SQLite，此后以数据库为准，
+      # 值班员替换的地址不会因重启被悄悄还原
       UPSTREAMS: "alpha=http://upstream-a:8000;beta=http://upstream-b:8000"
       INITIAL_TARGET: alpha
       GATEWAY_DB: /data/gateway.db
+      GATEWAY_INSTANCE: gateway-1   # 在途记录按实例归属，重启只清理自己的
     ports:
       - "8080:8000"
     volumes:
       - gateway-data:/data
     depends_on:
       - upstream-a
+      - upstream-a2
+      - upstream-b
+
+  gateway-2:           # 与 gateway-1 共用一个 SQLite 库，演示跨实例地址替换
+    build: ./gateway
+    environment:
+      UPSTREAMS: "alpha=http://upstream-a:8000;beta=http://upstream-b:8000"
+      INITIAL_TARGET: alpha
+      GATEWAY_DB: /data/gateway.db
+      GATEWAY_INSTANCE: gateway-2
+    ports:
+      - "8081:8000"
+    volumes:
+      - gateway-data:/data
+    depends_on:
+      - upstream-a
+      - upstream-a2
       - upstream-b
 
 volumes:
